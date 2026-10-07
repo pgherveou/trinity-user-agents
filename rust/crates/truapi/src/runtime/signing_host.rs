@@ -215,6 +215,17 @@ impl SigningHost {
         }
         self.auth_state.store_disconnected();
     }
+
+    /// Permanently invalidate this wallet owner and its pending activations.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn retire(&self) {
+        {
+            let mut state = self.grants.lifecycle();
+            state.clear_memory();
+            self.wallet.retire();
+        }
+        self.auth_state.store_disconnected();
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
