@@ -334,46 +334,11 @@ impl StatementStoreAllowanceKey {
     }
 }
 
-/// Host-level account authority used by product runtimes.
-///
-/// Pairing hosts implement this by forwarding authority requests to a paired
-/// signing host. A signing-host implementation can later provide the same
-/// surface from local keys without changing product runtime code.
+/// Account derivation, signing and resource allocation for an active session.
 #[async_trait]
-pub trait ProductAuthority: Send + Sync {
+pub trait AccountHolder: Send + Sync {
     /// Current account-authority session, if connected.
     fn current_session(&self) -> Option<AuthoritySession>;
-
-    /// Shared session holder owned by this authority.
-    ///
-    /// Product runtimes use it for connection-status subscriptions. The
-    /// concrete authority keeps ownership of the actual session material.
-    fn session_state(&self) -> Arc<SessionState>;
-
-    /// Seed a paired product subtree in unit tests that exercise later authority calls.
-    #[cfg(test)]
-    fn cache_product_subtree_for_test(
-        &self,
-        _session: &SessionInfo,
-        _product_id: &str,
-        _public_key: [u8; 32],
-    ) {
-    }
-
-    /// Request account connection for the calling product.
-    async fn request_login(
-        &self,
-        product: &ProductContext,
-    ) -> Result<HostRequestLoginResponse, CallError<HostRequestLoginError>>;
-
-    /// Disconnect the current account-authority session.
-    async fn disconnect(&self);
-
-    /// Refresh identity fields for the current session if the authority can do
-    /// so without user interaction.
-    async fn refresh_session_identity(&self) -> Option<AuthoritySession> {
-        self.current_session()
-    }
 
     /// Return the public key of `//product//{product_id}`.
     ///
@@ -386,44 +351,6 @@ pub trait ProductAuthority: Send + Sync {
         product_id: String,
     ) -> Result<[u8; 32], AuthorityError>;
 
-    /// Whether resolving `product_id`'s subtree would reach the Account Holder
-    /// over SSO rather than resolve locally. Gates a host consent prompt: a
-    /// pairing host returns `true` only on a cold cache; a signing host derives
-    /// locally and returns `false`. Required rather than defaulted, so a new
-    /// authority cannot skip the consent gate by omission.
-    async fn subtree_resolution_reaches_account_holder(
-        &self,
-        session: &AuthoritySession,
-        product_id: &str,
-    ) -> bool;
-
-    /// Whether `calling_product_id` may sign with `account` without confirmation.
-    ///
-    /// Only a product's own accounts are covered. Signing hosts trust
-    /// first-party products on the remote-permission allowlist; pairing hosts
-    /// require an explicitly allocated product subtree secret. Neither grants
-    /// access to legacy or identity accounts.
-    ///
-    /// [`AutoSigningGrant::Active`] is a promise, not a hint: the matching
-    /// `sign_*` call uses keys already held by this authority, without reaching
-    /// a paired host or raising a prompt on either side. The capability layer
-    /// skips its consent gate on that promise, so an authority that cannot keep
-    /// it answers `Absent`.
-    ///
-    /// `Err` is a hard failure - a broken or foreign grant slot, a stale
-    /// session, unreadable core storage - and is propagated rather than
-    /// downgraded into a prompt. A grant slot the authority has just decided to
-    /// erase must not produce a modal asking the user to approve it.
-    ///
-    /// Required rather than defaulted, so a new authority can neither skip the
-    /// consent gate nor silently claim a grant by omission.
-    async fn auto_signing_status(
-        &self,
-        session: &AuthoritySession,
-        calling_product_id: &str,
-        account: &ProductAccountId,
-    ) -> Result<AutoSigningGrant, AuthorityError>;
-
     /// Sign an RFC-0023 Merlin transcript with a product account.
     async fn sign_vrf(
         &self,
@@ -435,11 +362,8 @@ pub trait ProductAuthority: Send + Sync {
 
     /// Sign a SCALE transaction payload for a product account.
     ///
-    /// `calling_product_id` is the product making the call, which is not always
-    /// the product the account belongs to; an authority that can serve the
-    /// account locally must bind the two before it does. `None` is a path that
-    /// carries no caller identity — the SSO relay — and an authority that
-    /// cannot identify the caller must not serve the account locally.
+    /// Local signing requires binding `calling_product_id` to account ownership.
+    /// `None` carries no caller identity and cannot authorize local signing.
     async fn sign_payload(
         &self,
         cx: &CallContext,
@@ -451,7 +375,7 @@ pub trait ProductAuthority: Send + Sync {
     /// Sign arbitrary bytes for a product account.
     ///
     /// `calling_product_id` carries the same binding obligation as
-    /// [`ProductAuthority::sign_payload`].
+    /// [`AccountHolder::sign_payload`].
     async fn sign_raw(
         &self,
         cx: &CallContext,
@@ -464,7 +388,7 @@ pub trait ProductAuthority: Send + Sync {
     /// Build a transaction for a product account, signed unless the request
     /// supplies its own V5 `VerifyMultiSignature` extension.
     /// `calling_product_id` carries the same binding obligation as
-    /// [`ProductAuthority::sign_payload`].
+    /// [`AccountHolder::sign_payload`].
     async fn create_transaction(
         &self,
         cx: &CallContext,
@@ -528,39 +452,6 @@ pub trait ProductAuthority: Send + Sync {
         request: HostRequestResourceAllocationRequest,
     ) -> Result<HostRequestResourceAllocationResponse, AuthorityError>;
 
-    /// Return statement-store allowance key material for the calling product.
-    async fn statement_store_allowance_key(
-        &self,
-        cx: &CallContext,
-        session: &AuthoritySession,
-        product_id: String,
-    ) -> Result<StatementStoreAllowanceKey, AuthorityError>;
-
-    /// Drop the product's cached statement-store allowance key if it is
-    /// `public_key`. Only the local signing host caches that key; the default
-    /// does nothing.
-    fn forget_statement_store_allowance_key(&self, _product_id: &str, _public_key: [u8; 32]) {}
-
-    /// Return Bulletin allowance key material for the calling product.
-    async fn bulletin_allowance_key(
-        &self,
-        cx: &CallContext,
-        session: &AuthoritySession,
-        product_id: String,
-    ) -> Result<BulletinAllowanceKey, AuthorityError>;
-
-    /// Evict any cached Bulletin allowance key for the product and allocate a
-    /// fresh one, increasing the existing allowance.
-    ///
-    /// Called after a submission is rejected for an exhausted/missing
-    /// allowance, where reusing the cached key would loop forever.
-    async fn refresh_bulletin_allowance_key(
-        &self,
-        cx: &CallContext,
-        session: &AuthoritySession,
-        product_id: String,
-    ) -> Result<BulletinAllowanceKey, AuthorityError>;
-
     /// Sign exact statement-store proof bytes with a product-derived account.
     async fn sign_statement_store_product_payload(
         &self,
@@ -581,12 +472,95 @@ pub trait ProductAuthority: Send + Sync {
 
     /// Key material for minting contact handles.
     ///
-    /// Product-independent by construction, unlike [`Self::derive_entropy`]: one
-    /// contact must hash to the same handle in every product. Derived from the
-    /// session's root entropy source, which both roles hold and which no product
-    /// can reach — a handle keyed on anything public would be recoverable by
-    /// hashing candidate accounts.
+    /// Uses the session's secret root entropy source so handles match across
+    /// products and host roles. The key must remain inaccessible to products
+    /// to prevent recovering contacts by hashing candidate accounts.
     fn contacts_handle_key(&self, session: &AuthoritySession) -> Result<[u8; 32], AuthorityError>;
+}
+
+/// Host lifecycle, grant checks and cached allowance keys for product runtimes.
+#[async_trait]
+pub trait ProductAuthority: AccountHolder {
+    /// Connection-status subscriptions without transferring session ownership.
+    fn session_state(&self) -> Arc<SessionState>;
+
+    /// Seed the paired subtree cache for account-operation tests.
+    #[cfg(test)]
+    fn cache_product_subtree_for_test(
+        &self,
+        _session: &SessionInfo,
+        _product_id: &str,
+        _public_key: [u8; 32],
+    ) {
+    }
+
+    /// Request account connection for the calling product.
+    async fn request_login(
+        &self,
+        product: &ProductContext,
+    ) -> Result<HostRequestLoginResponse, CallError<HostRequestLoginError>>;
+
+    /// Disconnect the current account-authority session.
+    async fn disconnect(&self);
+
+    /// Refresh session identity without user interaction.
+    async fn refresh_session_identity(&self) -> Option<AuthoritySession> {
+        self.current_session()
+    }
+
+    /// Whether subtree resolution needs SSO and therefore host consent.
+    ///
+    /// True for a paired cache miss; false for local derivation or a cached subtree.
+    async fn subtree_resolution_reaches_account_holder(
+        &self,
+        session: &AuthoritySession,
+        product_id: &str,
+    ) -> bool;
+
+    /// Whether `calling_product_id` may sign with `account` without confirmation.
+    ///
+    /// Covers only the caller's own product accounts, excluding legacy and
+    /// identity accounts. Signing hosts accept allowlisted products or explicit
+    /// local grants; pairing hosts require an allocated product subtree secret.
+    ///
+    /// [`AutoSigningGrant::Active`] guarantees signing with held keys, without
+    /// SSO or prompts. Return `Absent` if that guarantee cannot be met. Session,
+    /// storage and invalid-grant errors must propagate instead of prompting.
+    async fn auto_signing_status(
+        &self,
+        session: &AuthoritySession,
+        calling_product_id: &str,
+        account: &ProductAccountId,
+    ) -> Result<AutoSigningGrant, AuthorityError>;
+
+    /// Return statement-store allowance key material for the calling product.
+    async fn statement_store_allowance_key(
+        &self,
+        cx: &CallContext,
+        session: &AuthoritySession,
+        product_id: String,
+    ) -> Result<StatementStoreAllowanceKey, AuthorityError>;
+
+    /// Forget the cached key only if it matches `public_key`, preserving any
+    /// replacement. Hosts without a local cache use the no-op default.
+    fn forget_statement_store_allowance_key(&self, _product_id: &str, _public_key: [u8; 32]) {}
+
+    /// Return Bulletin allowance key material for the calling product.
+    async fn bulletin_allowance_key(
+        &self,
+        cx: &CallContext,
+        session: &AuthoritySession,
+        product_id: String,
+    ) -> Result<BulletinAllowanceKey, AuthorityError>;
+
+    /// Invalidate the cached Bulletin key and increase or recreate its allowance
+    /// after a submission is rejected for an exhausted or missing allowance.
+    async fn refresh_bulletin_allowance_key(
+        &self,
+        cx: &CallContext,
+        session: &AuthoritySession,
+        product_id: String,
+    ) -> Result<BulletinAllowanceKey, AuthorityError>;
 }
 
 /// Build the neutral authority-session snapshot for `session`.
