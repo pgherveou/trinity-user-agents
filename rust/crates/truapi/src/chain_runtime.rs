@@ -72,7 +72,19 @@ use truapi::v01::{
 	RuntimeSpec, RuntimeType, StorageQueryItem, StorageQueryType, StorageResultItem,
 };
 
-use crate::{host_rpc_client::HostRpcClient, subscription::Spawner, time::Timer};
+use crate::{
+	host_rpc_client::HostRpcClient,
+	subscription::Spawner,
+	time::{RealTimer, Timer},
+};
+
+mod chain_halt;
+mod current_block;
+mod follow_retry;
+
+pub use chain_halt::{retry_while_halted, says_chain_halted};
+pub use current_block::CurrentBlockError;
+use follow_retry::{FollowReport, FollowRetryingRpcClient};
 
 mod runtime_call_cache;
 mod runtime_call_client;
@@ -149,6 +161,8 @@ type SubxtConnectionSetup = Shared<BoxFuture<'static, Result<SubxtConnection, Ru
 pub struct SubxtConnection {
 	/// Client whose chain config pins the host-configured genesis hash.
 	pub client: OnlineClient<SubstrateConfig>,
+	/// What the backend's RPC client has learned about its follow.
+	follow: Arc<FollowReport>,
 }
 
 /// Cached Subxt client over the legacy JSON-RPC methods, which reach any
@@ -380,6 +394,8 @@ pub struct ChainRuntime {
 	/// Mints the sequence above. One counter for every scope, so no two
 	/// callers can be handed the same operation id.
 	next_transaction_operation_id: Arc<AtomicU64>,
+	/// Paces follow retries and bounds reads, so tests can control the waits.
+	timer: Arc<dyn Timer>,
 	/// Runtime call outputs every connection shares, so the products and the
 	/// core download the runtime metadata of a chain once between them.
 	runtime_calls: RuntimeCallCache,
@@ -466,12 +482,21 @@ impl ChainRuntime {
 			follow_intents: Arc::new(Mutex::new(HashMap::new())),
 			transaction_operations: Arc::new(Mutex::new(HashMap::new())),
 			next_transaction_operation_id: Arc::new(AtomicU64::new(1)),
+			timer: Arc::new(RealTimer),
 			runtime_calls: RuntimeCallCache::default(),
 			ended_follows: Arc::new(Mutex::new(HashMap::from([(
 				ConnectionScope::Core,
 				VecDeque::new(),
 			)]))),
 		}
+	}
+
+	/// This runtime on `timer` instead of wall-clock time. Set it before the
+	/// first connection, which keeps the timer it opened with.
+	#[cfg(test)]
+	pub fn with_timer(mut self, timer: Arc<dyn Timer>) -> Self {
+		self.timer = timer;
+		self
 	}
 
 	/// This runtime seen as `scope`. Shares every map with the original, so a
@@ -1036,10 +1061,6 @@ impl ChainRuntime {
 		&self,
 		genesis_hash: &[u8],
 	) -> Result<OnlineClient<SubstrateConfig>, RuntimeFailure> {
-		debug_assert!(
-			matches!(self.scope, ConnectionScope::Core),
-			"the Subxt backend's driver task defeats release_scope on a product scope",
-		);
 		Ok(self.subxt_connection(genesis_hash).await?.client)
 	}
 
@@ -1071,6 +1092,10 @@ impl ChainRuntime {
 		&self,
 		genesis_hash: &[u8],
 	) -> Result<SubxtConnection, RuntimeFailure> {
+		debug_assert!(
+			matches!(self.scope, ConnectionScope::Core),
+			"the Subxt backend's driver task defeats release_scope on a product scope",
+		);
 		let connection = self.connection_for("subxt_connection", genesis_hash).await?;
 		connection.subxt_connection().await
 	}
@@ -1093,6 +1118,7 @@ impl ChainRuntime {
 				_ => {
 					let provider = self.provider.clone();
 					let spawner = self.spawner.clone();
+					let timer = self.timer.clone();
 					let registry = Arc::downgrade(&self.connections);
 					let scope = self.scope;
 					let ended_follows = self.ended_follows.clone();
@@ -1106,6 +1132,7 @@ impl ChainRuntime {
 							ChainConnection::new(
 								rpc,
 								spawner,
+								timer,
 								genesis_hash,
 								runtime_calls,
 								scope,
@@ -1346,6 +1373,8 @@ struct ChainConnection {
 	/// Typed `chainHead_v1` calls over `runtime_call_client`.
 	methods: ChainHeadRpcMethods<TruapiRpcConfig>,
 	spawner: Spawner,
+	/// Paces the Subxt backend's follow retries.
+	timer: Arc<dyn Timer>,
 	/// Host-configured genesis hash this connection was opened for; pins the
 	/// cached Subxt bundle's chain config.
 	genesis_hash: Vec<u8>,
@@ -1382,6 +1411,7 @@ impl ChainConnection {
 	fn new(
 		rpc: Arc<dyn JsonRpcConnection>,
 		spawner: Spawner,
+		timer: Arc<dyn Timer>,
 		genesis_hash: Vec<u8>,
 		runtime_calls: RuntimeCallCache,
 		scope: ConnectionScope,
@@ -1396,6 +1426,7 @@ impl ChainConnection {
 			runtime_call_client,
 			methods,
 			spawner,
+			timer,
 			genesis_hash,
 			follows: Mutex::new(HashMap::new()),
 			follow_setups: Mutex::new(HashMap::new()),
@@ -1463,8 +1494,13 @@ impl ChainConnection {
 		let config = self.chain_config(METHOD)?;
 		// Subxt waits only for a call to finish, never retrying an inaccessible
 		// one, so it must not wait on a download another caller may give up.
-		let (backend, mut driver) = ChainHeadBackend::<SubstrateConfig>::builder()
-			.build(RpcClient::new(self.runtime_call_client.without_waiting()));
+		let rpc = FollowRetryingRpcClient::new(
+			self.runtime_call_client.without_waiting(),
+			self.timer.clone(),
+		);
+		let follow = rpc.report();
+		let (backend, mut driver) =
+			ChainHeadBackend::<SubstrateConfig>::builder().build(RpcClient::new(rpc));
 		// The pump holds only a weak handle so a torn-down connection is not
 		// kept alive by its own driver task.
 		let pump_connection = Arc::downgrade(&self);
@@ -1472,7 +1508,7 @@ impl ChainConnection {
 			async move {
 				while let Some(result) = driver.next().await {
 					if let Err(error) = result {
-						tracing::debug!(target: "subxt", "chainHead backend error={error}");
+						warn!(target: "subxt", "chainHead backend error={error}");
 					}
 				}
 				// The backend can make no further progress; drop the cached
@@ -1488,7 +1524,7 @@ impl ChainConnection {
 		let client = OnlineClient::from_backend_with_config(config, backend.clone())
 			.await
 			.map_err(|error| RuntimeFailure::host_failure(METHOD, error.to_string()))?;
-		Ok(SubxtConnection { client })
+		Ok(SubxtConnection { client, follow })
 	}
 
 	/// The config every Subxt client on this connection is built with. It
